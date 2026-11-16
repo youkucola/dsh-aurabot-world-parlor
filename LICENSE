@@ -1,0 +1,38 @@
+world-parlor LICENSE (MIT)
+
+说明：本文件保留自源项目的两份版权声明（源项目同样以 MIT 发布）：
+  Copyright (c) 2026 Phantivia                  -- 源项目根 LICENSE（上游仓库与本机包内均有）
+  Copyright (c) 2026 meow-ai-arena contributors -- 上游 GitHub 仓库 src/room/ratings/LICENSE
+来源：https://github.com/biliye/cortico-world-parlor (MIT)
+注：第二份版权声明的出处是上游 GitHub 仓库内的 src/room/ratings/LICENSE，
+    本机 Coopanion 安装包内并不包含该文件（只含仓库根 LICENSE）。
+
+本模块 world-parlor 为对上述项目的移植/改写，同样以 MIT 许可证发布。
+本模块运行时复用本机 Coopanion 安装的 cortico-world-parlor 源码（不在本仓库内分发），
+上述两份源版权声明与 MIT 声明一并延续适用于该复用。
+
+---------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 Phantivia
+Copyright (c) 2026 meow-ai-arena contributors
+Copyright (c) 2026 youkucola
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
