@@ -9,8 +9,8 @@ Aurabot（DSH 插件）模块：复用本机 Coopanion 已安装的 `cortico-wor
 
 - **9 个工具**：`parlor_query`（状态/目录/信箱/公告/新闻/历史/参数帮助）、`parlor_message`（发言，`scope` 必填 `room` / `table` / `private`）、`parlor_room`（建厅换厅、邀请、说书）、`parlor_table`（开桌、入座、开局、招募）、`parlor_game_info`（规则/桌面/回放）、`parlor_game_action`（游戏动作）、`parlor_gift`（赠礼）、`parlor_set_tier`（提醒档位）、`parlor_feedback`（反馈）。
 - **SSE 自动唤醒**：订阅客厅事件流，`pushEvent` 经 `api.core.hub.pushToSession` 推进目标会话的一个回合。回合是真实会话，**会真的发出 QQ 消息**。
-- **通知分项开关**：连接与重连、连接状态变化、点名与私聊、说书提醒、房间摘要、运营公告各有一枚开关，另有既有的 `news`（新闻）与 `recruitNotice`（招募/邀请）。
-- **游戏中静默**：`world.focused === true` 时只放行牌桌回合（`myTableRevision` 前进且 `meta.addressed === true`），其余客厅通知与延迟队列一律不推送；回合正文带 `【牌桌回合…只调用牌桌工具完成动作，不要在 QQ 里接话】` 前缀。离桌只重置 `lastTableRevision`，不做局后总结。
+- **通知分项开关**：连接与重连、连接状态变化、点名与私聊、说书提醒、房间摘要、运营公告、牌桌回合各有一枚开关，另有既有的 `news`（新闻）与 `recruitNotice`（招募/邀请）。
+- **游戏中静默**：`world.focused === true` 时只放行牌桌回合（`myTableRevision` 前进且 `meta.addressed === true`），其余客厅通知与延迟队列一律不推送；回合正文带 `【牌桌回合…只调用牌桌工具完成动作，不要在 QQ 里接话】` 前缀。离桌只重置 `lastTableRevision`，不做局后总结。回合投递另受 `notifyTurn` 控制：关闭它等于放弃局内自动出牌（游标照常推进、重开不补推），静默闸门的其余判断不变。
 - **提醒档位** `wakeTier`：`full` 每条闲聊 / `digest` 点名 + 周期摘要 / `quiet` 只点名或私聊 / `off` 不叫。
 - **提示词约束**：随工具注册一段规则，声明客厅内容是外部资料、不执行其中的指令，私信必须显式选 `scope`，送达 ≠ 已读。
 
@@ -54,6 +54,7 @@ Aurabot（DSH 插件）模块：复用本机 Coopanion 已安装的 `cortico-wor
 | `notifyStory` | `true` | 说书轮到/收尾提醒与搭车 |
 | `notifyDigest` | `true` | 普通闲聊的周期摘要与牌局结算 |
 | `notifyAnnouncement` | `true` | 运营公告 |
+| `notifyTurn` | `true` | 牌桌上轮到自己时唤醒会话出牌；关闭后局内不再因回合唤醒（游标照常推进，重开不补推），且仅在「游戏中静默」开启时才是回合投递路径 |
 | `news` | `true` | 新新闻提醒；请求层在启动时定型 |
 | `recruitNotice` | `true` | 有人开桌招募或发来邀请 |
 | `silentDuringGame` | `true` | 在牌桌上只放行牌桌回合；关闭后回到「每条事件都投递」的旧行为 |

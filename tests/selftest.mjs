@@ -15,7 +15,7 @@ import { locateCoopanion, createAdapter, mapToolDefs, stagePlugin } from '../lib
 const TOOL_NAMES = ['parlor_query', 'parlor_message', 'parlor_room', 'parlor_table',
   'parlor_game_info', 'parlor_game_action', 'parlor_gift', 'parlor_set_tier', 'parlor_feedback']
 // 通知分项开关：news 沿用既有 news 键，不在这里。
-const NOTIFY_KEYS = ['notifyStarted', 'notifyLink', 'notifyMessage', 'notifyStory', 'notifyDigest', 'notifyAnnouncement']
+const NOTIFY_KEYS = ['notifyStarted', 'notifyLink', 'notifyMessage', 'notifyStory', 'notifyDigest', 'notifyAnnouncement', 'notifyTurn']
 const FAKE = {
   seat: 'fake-seat-token-selftest-only',
   owner: 'fake-owner-token-selftest-only',
@@ -591,7 +591,7 @@ async function main() {
     }
 
     await check('牌桌配置项：默认开启且为 switch（不得复用 focus 键）', () => {
-      const cases = [['silentDuringGame', '游戏中保持安静']]
+      const cases = [['silentDuringGame', '游戏中保持安静'], ['notifyTurn', '通知：牌桌回合']]
       for (const [key, label] of cases) {
         const setting = SETTINGS.find((s) => s.key === key)
         assert.ok(setting, `缺少设置项 ${key}`)
@@ -649,6 +649,37 @@ async function main() {
         assert.equal(typeof again.cursor, 'number')
       } finally {
         config.notifyMessage = true
+      }
+    }))
+
+    await check('通知开关：notifyTurn 关闭即不投递回合、重开恢复', () => withAdapterRunning(async () => {
+      const prev = { targetChat: config.targetChat, silentDuringGame: config.silentDuringGame }
+      config.targetChat = 'private:12345'
+      config.notifyTurn = false
+      try {
+        // 局前先攒一条 deferred：被拦下的回合若顺手抽干队列，就等于把局内提示漏到局后。
+        adapter.host.pushDeferred({ type: 'parlor.message', meta: { story: 's-turn-off' }, render: async () => '局前攒下的提示' }, {})
+        assert.equal(adapter.state.deferred.length, 1, '夹具：局前应有 1 条 deferred')
+        adapter.world.focused = true
+        adapter.world.myTableRevision = 1
+        adapter.state.lastTableRevision = 1
+        const before = pushCalls.length
+        adapter.world.myTableRevision = 2
+        const out = await adapter.host.pushEvent({ type: 'parlor.message', text: '轮到你出牌', meta: { addressed: true } }, {})
+        assert.equal(pushCalls.length, before, 'notifyTurn:false 时局内回合不得唤醒会话')
+        assert.equal(out.type, 'parlor.message', '被拦下的回合仍要返回 envelope')
+        assert.equal(typeof out.cursor, 'number', '被拦下的回合仍要返回游标，让插件照常推进游标')
+        assert.equal(adapter.state.lastTableRevision, 2, '被拦下的回合已消费：版本已推进，重开不补推')
+        assert.equal(adapter.state.deferred.length, 1, '被拦下的回合不得抽干 deferred')
+        config.notifyTurn = true
+        adapter.world.myTableRevision = 3
+        await adapter.host.pushEvent({ type: 'parlor.message', text: '轮到你出牌', meta: { addressed: true } }, {})
+        assert.equal(pushCalls.length, before + 1, 'notifyTurn 改回 true 后同一形态事件应立即恢复投递')
+        assert.ok(String(pushCalls.at(-1).content[0].text).startsWith('【牌桌回合'), '恢复投递后仍走回合前缀')
+      } finally {
+        config.notifyTurn = true
+        config.targetChat = prev.targetChat
+        config.silentDuringGame = prev.silentDuringGame
       }
     }))
 
