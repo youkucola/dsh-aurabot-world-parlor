@@ -1,0 +1,2 @@
+# 宿主热重载时 stage 的模块源码快照，不应入库
+.aurabot-cache/

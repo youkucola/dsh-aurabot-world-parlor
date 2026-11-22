@@ -1,8 +1,8 @@
 {
-  "id": "world-parlor",
+  "id": "aurabot-world-parlor",
   "name": "世界客厅",
-  "version": "0.2.0",
-  "description": "复用本机 Coopanion 客厅插件源码，连接 parlor.com.cn 真实会馆（9 个工具 + SSE 唤醒；通知可按类型开关；游戏中静默）",
+  "version": "0.2.1",
+  "description": "复用本机 Coopanion 客厅插件源码，连接 parlor.com.cn 真实会馆（10 个工具 + SSE 唤醒；通知可按类型开关；游戏中静默）",
   "category": "tool",
   "tags": ["parlor", "tools", "wake"],
   "author": "youkucola",

@@ -1,4 +1,4 @@
-// 适配层自测：不联网、不调用 adapter.start()、不读真实 Coopanion 凭据。
+// 适配层自测：全程不联网（启动前席位自愈用例也一律注入 fetch），只用临时假插件/假身份，不读真实 Coopanion 凭据。
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -11,11 +11,15 @@ import {
   describeTools, nowIso, getTimezoneOffsetMinutes,
 } from '../lib/cortico-shim.mjs'
 import { locateCoopanion, createAdapter, mapToolDefs, stagePlugin } from '../lib/coopanion.mjs'
+import { DEFAULT_INVITE_CODE, PARLOR_DEFAULT_ORIGIN, recoverSeat, seatConflictHint } from '../lib/seat-recovery.mjs'
 
+// 上游插件 0.45.2 自带的 9 个工具；换票工具是适配层自有的第 10 个（见 ALL_TOOL_NAMES），
+// 不能放进 TOOL_NAMES，否则假插件会自己声明同名工具，与适配层追加的那份重复。
 const TOOL_NAMES = ['parlor_query', 'parlor_message', 'parlor_room', 'parlor_table',
   'parlor_game_info', 'parlor_game_action', 'parlor_gift', 'parlor_set_tier', 'parlor_feedback']
+const ALL_TOOL_NAMES = [...TOOL_NAMES, 'parlor_identity_ticket']
 // 通知分项开关：news 沿用既有 news 键，不在这里。
-const NOTIFY_KEYS = ['notifyStarted', 'notifyLink', 'notifyMessage', 'notifyStory', 'notifyDigest', 'notifyAnnouncement', 'notifyTurn']
+const NOTIFY_KEYS = ['notifyStarted', 'notifyLink', 'notifyMessage', 'notifyStory', 'notifyDigest', 'notifyTableEnd', 'notifyAnnouncement', 'notifyTurn']
 const FAKE = {
   seat: 'fake-seat-token-selftest-only',
   owner: 'fake-owner-token-selftest-only',
@@ -33,6 +37,29 @@ fs.writeFileSync(path.join(companion, '.env'),
   `PARLOR_SEAT_TOKEN=${FAKE.seat}\nPARLOR_OWNER_TOKEN=${FAKE.owner}\nPARLOR_INVITE_CODE=${FAKE_PRIVATE_INVITE}\n`)
 fs.writeFileSync(path.join(companion, 'data', 'parlor-identity.json'), JSON.stringify({
   cooId: 'selftest-coo-0001', cooSecret: FAKE.secret, authority: 'https://example.invalid', handle: 'selftest',
+}))
+// Coopanion 自己的 config.json：换票工具从 worlds.parlor 读会馆地址与邀请码（适配层其余代码从不读它）。
+const PARLOR_CONFIG = {
+  worlds: {
+    parlor: {
+      serverUrl: 'https://parlor.example.invalid',
+      identityUrl: 'https://parlor.example.invalid',
+      inviteCode: 'fake-config-invite-selftest',
+      seatName: 'Selftest Seat',
+    },
+  },
+}
+fs.writeFileSync(path.join(companion, 'config.json'), JSON.stringify(PARLOR_CONFIG))
+// 「缺 inviteCode」变体：config.json 与 .env 都没有邀请码，换票必须明确失败且不联网。
+const noInviteHome = path.join(tmp, 'coopanion-noinvite')
+const noInviteCompanion = path.join(noInviteHome, 'home', 'companion')
+fs.mkdirSync(path.join(noInviteCompanion, 'data'), { recursive: true })
+fs.writeFileSync(path.join(noInviteCompanion, '.env'), `PARLOR_SEAT_TOKEN=${FAKE.seat}\nPARLOR_OWNER_TOKEN=${FAKE.owner}\n`)
+fs.writeFileSync(path.join(noInviteCompanion, 'config.json'), JSON.stringify({
+  worlds: { parlor: { serverUrl: 'https://parlor.example.invalid', identityUrl: 'https://parlor.example.invalid', seatName: 'Selftest Seat' } },
+}))
+fs.writeFileSync(path.join(noInviteCompanion, 'data', 'parlor-identity.json'), JSON.stringify({
+  cooId: 'selftest-coo-0002', cooSecret: FAKE.secret, authority: 'https://example.invalid', handle: 'selftest2',
 }))
 
 const config = { ...DEFAULTS, targetChat: '' }
@@ -78,7 +105,7 @@ export default {
   defaults: () => ({ serverUrl: 'https://example.invalid', room: 'hall', seatName: '',
     wakeTier: 'digest', news: true, recruitNotice: true, inviteCode: ${JSON.stringify(FAKE.invite)}, enabled: false }),
   create: () => ({ tools: () => decls.map(d => ({ ...d, handler: async () => 'stub-help-ok' })),
-    async start() {}, async stop() {} }),
+    onRoomEvent() {}, async start() {}, async stop() {} }),
 };
 `)
   return dir
@@ -187,15 +214,16 @@ async function main() {
     assertNodeSupport()
 
     let adapter
-    await check('createAdapter 加载插件 / 9 工具 / 凭据落在自有目录', async () => {
+    await check('createAdapter 加载插件 / 10 工具 / 凭据落在自有目录', async () => {
       // overrides 只由 selftest 注入：假 coopanionHome 提供假身份/.env，绝不读真实凭据。
       adapter = await createAdapter({ api: mockApi, settings: { ...config }, overrides: { coopanionHome: fakeHome, pluginDir } })
       assert.ok(adapter.world && adapter.host && adapter.ctx && adapter.state && adapter.tools)
-      assert.equal(adapter.defs.length, 9)
-      assert.deepEqual(adapter.defs.map((d) => d.name), TOOL_NAMES)
-      assert.equal(adapter.tools.length, 9)
+      assert.equal(adapter.defs.length, 10)
+      assert.deepEqual(adapter.defs.map((d) => d.name), ALL_TOOL_NAMES)
+      assert.equal(adapter.tools.length, 10)
       assert.equal(typeof adapter.start, 'function')
       assert.equal(typeof adapter.stop, 'function')
+      assert.equal(typeof adapter.world.onRoomEvent, 'function', 'onRoomEvent 必须可包装以旁听牌局结算 seq')
       assert.ok(String(adapter.ctx.cfg.serverUrl).length > 0, 'serverUrl 不能为空')
       assert.equal(adapter.state.started, false, '自测不得触发 start()')
       assert.ok(fs.existsSync(path.join(mockApi.dataDir('cortico'), 'parlor-identity.json')))
@@ -244,8 +272,8 @@ async function main() {
           api: realApi, settings: { ...DEFAULTS }, overrides: { coopanionHome: fakeHome, pluginDir: realLoc.pluginDir },
         })
         try {
-          assert.equal(real.defs.length, 9)
-          assert.deepEqual(real.defs.map((d) => d.name), TOOL_NAMES)
+          assert.equal(real.defs.length, 10)
+          assert.deepEqual(real.defs.map((d) => d.name), ALL_TOOL_NAMES)
           assert.ok(!String(real.stagedRoot).includes('node_modules'))
           assert.equal(real.state.started, false)
           const help = await real.tools.find((t) => t.name === 'parlor_query').execute({ op: 'help' }, {})
@@ -262,7 +290,7 @@ async function main() {
 
     await check('mapToolDefs 产物形状', () => {
       const tools = mapToolDefs({ api: mockApi, defs: adapter.defs })
-      assert.equal(tools.length, 9)
+      assert.equal(tools.length, 10)
       for (const t of tools) {
         assert.ok(t.parameters?.properties, `${t.name} 缺 parameters.properties`)
         assert.equal(typeof t.execute, 'function', `${t.name} 缺 execute`)
@@ -448,7 +476,8 @@ async function main() {
       const before = pushCalls.length
       await adapter.host.pushEvent({ type: 'parlor.message', text: '有人叫你', meta: { addressed: true } }, {})
       assert.equal(pushCalls.length, before, 'notifyMessage:false 不应投递点名/私聊')
-      // 真实形状：牌局结算与账本/邀请/招募都渲染进 parlor.digest 正文，只能整体随 notifyDigest 消失。
+      // 真实形状：账本/邀请/招募都渲染进 parlor.digest 正文，只能整体随 notifyDigest 消失；
+      // 牌局结算虽然同样被合并进 digest，但另由 notifyTableEnd 独立放行（见下方结算用例）。
       const digest = { type: 'parlor.digest', text: '周期摘要：parlor.ledger 结算 / parlor.invite 邀请 / 阿茶开桌招募', meta: { addressed: false } }
       await adapter.host.pushEvent(digest, {})
       assert.equal(pushCalls.length, before + 1, 'digest 受 notifyDigest 控制，不受 notifyMessage 影响')
@@ -566,7 +595,7 @@ async function main() {
       assert.equal(adapter.state.deferred.length, 0, '允许的事件应抽干队列')
     })
 
-    // ---- 牌桌行为：游戏中静默（只放行牌桌回合） ----
+    // ---- 牌桌行为：游戏中静默（只放行牌桌回合与牌局结算） ----
     // stub 插件的 world 是普通对象，可直接写 focused / myTableRevision；isInGame 还要求 started，
     // 故夹具手动置位并在 finally 复原（含牌桌版本，避免相邻用例互相影响）。
     const withAdapterRunning = async (fn) => {
@@ -580,6 +609,7 @@ async function main() {
         delete adapter.world.myTableRevision
         adapter.state.lastFocused = false
         adapter.state.lastTableRevision = undefined
+        adapter.state.lastTableEndSeq = undefined
         adapter.state.deferred.length = 0
         adapter.state.started = prev.started
         adapter.state.connected = prev.connected
@@ -587,11 +617,12 @@ async function main() {
         config.notifyMessage = true
         config.notifyStory = true
         config.notifyDigest = true
+        config.notifyTableEnd = true
       }
     }
 
     await check('牌桌配置项：默认开启且为 switch（不得复用 focus 键）', () => {
-      const cases = [['silentDuringGame', '游戏中保持安静'], ['notifyTurn', '通知：牌桌回合']]
+      const cases = [['silentDuringGame', '游戏中保持安静'], ['notifyTurn', '通知：牌桌回合'], ['notifyTableEnd', '通知：牌局结算']]
       for (const [key, label] of cases) {
         const setting = SETTINGS.find((s) => s.key === key)
         assert.ok(setting, `缺少设置项 ${key}`)
@@ -678,6 +709,69 @@ async function main() {
         assert.ok(String(pushCalls.at(-1).content[0].text).startsWith('【牌桌回合'), '恢复投递后仍走回合前缀')
       } finally {
         config.notifyTurn = true
+        config.targetChat = prev.targetChat
+        config.silentDuringGame = prev.silentDuringGame
+      }
+    }))
+
+    await check('通知开关：notifyTableEnd 放行结算，独立于摘要开关', () => withAdapterRunning(async () => {
+      const prev = {
+        targetChat: config.targetChat, notifyDigest: config.notifyDigest,
+        notifyTableEnd: config.notifyTableEnd, silentDuringGame: config.silentDuringGame,
+      }
+      config.targetChat = 'private:12345'
+      config.silentDuringGame = true
+      // 真实形状：插件只把 parlor.table.end 合并进 parlor.digest 交给适配层，type 上看不出结算；
+      // 唯一定位来源是 onRoomEvent 旁听到的 seq 与 meta.seq（批次最后一条）相等。
+      const tableEnd = (seq) => ({
+        type: 'parlor.table.end', seq, ts: Date.now(), from: 'system',
+        scope: { kind: 'table' }, text: '本局结束', data: { tableId: 'test-table' },
+      })
+      try {
+        adapter.state.lastTableEndSeq = undefined
+        adapter.state.lastFocused = false
+        adapter.world.focused = false
+        config.notifyDigest = false
+        config.notifyTableEnd = true
+        let before = pushCalls.length
+        adapter.world.onRoomEvent(tableEnd(42))
+        await adapter.host.pushEvent({ type: 'parlor.digest', text: '（桌子）本局结束', meta: { seq: 42, count: 1, addressed: false } }, {})
+        assert.equal(pushCalls.length, before + 1, 'notifyTableEnd:true 时结算必须投递，即使 notifyDigest:false')
+        assert.ok(String(pushCalls.at(-1).content[0].text).includes('本局结束'))
+
+        // 关闭后不投递，但仍返回 envelope：插件以是否抛错决定游标推进，关掉等于已消费、重开不补推。
+        config.notifyTableEnd = false
+        // 摘要开关必须开着：否则即使删掉 notifyTableEnd 闸门，这条断言也会因 notifyDigest:false 而空转通过。
+        config.notifyDigest = true
+        before = pushCalls.length
+        adapter.world.onRoomEvent(tableEnd(43))
+        const blocked = await adapter.host.pushEvent({ type: 'parlor.digest', text: '（桌子）本局结束 43', meta: { seq: 43, count: 1, addressed: false } }, {})
+        assert.equal(pushCalls.length, before, 'notifyTableEnd:false 时结算不得投递（摘要开关已开，只能由结算闸门拦下）')
+        assert.equal(blocked.type, 'parlor.digest', '被拦下的结算仍要返回 envelope')
+        assert.equal(typeof blocked.cursor, 'number', '被拦下的结算仍要返回游标')
+        // 复原摘要开关：下面的「一次性消费」用例要靠 notifyDigest:false 证明同一 seq 不再命中结算特判。
+        config.notifyDigest = false
+
+        // 局内结算：静默闸门必须为结算开口，否则整局只有回合能出话。
+        config.notifyTableEnd = true
+        adapter.world.focused = true
+        before = pushCalls.length
+        adapter.world.onRoomEvent(tableEnd(44))
+        await adapter.host.pushEvent({ type: 'parlor.digest', text: '（桌子）本局结束 44', meta: { seq: 44, count: 1, addressed: false } }, {})
+        assert.equal(pushCalls.length, before + 1, '局内结算必须绕过静默闸门投递')
+        assert.ok(String(pushCalls.at(-1).content[0].text).includes('本局结束 44'))
+
+        // 一次性消费：同一 seq 再来一次不再命中结算特判，退回摘要开关（notifyDigest:false 即不投递）。
+        adapter.world.focused = false
+        before = pushCalls.length
+        const reused = await adapter.host.pushEvent({ type: 'parlor.digest', text: '（桌子）本局结束 44', meta: { seq: 44, count: 1, addressed: false } }, {})
+        assert.equal(pushCalls.length, before, '同一 seq 第二次不得再走结算特判')
+        assert.equal(adapter.state.lastTableEndSeq, undefined, '结算 seq 必须一次性消费')
+        assert.equal(typeof reused.cursor, 'number')
+      } finally {
+        adapter.state.lastTableEndSeq = undefined
+        config.notifyDigest = prev.notifyDigest
+        config.notifyTableEnd = prev.notifyTableEnd
         config.targetChat = prev.targetChat
         config.silentDuringGame = prev.silentDuringGame
       }
@@ -816,6 +910,781 @@ async function main() {
         assert.ok(other.message.includes('未连接'))
       } finally {
         adapter.state.lastError = null
+      }
+    })
+
+    // ---- 统一身份票：真票只走工具返回值，不落盘/不打日志/不推送 ----
+    // token 是高熵串：QQ 正文（严格级脱敏）应该遮住它，而工具返回值（宽松级）必须原样给出。
+    const TICKET_TOKEN = 'tkt_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8'
+    const tzName = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai'
+    const ticketTool = adapter.tools.find((t) => t.name === 'parlor_identity_ticket')
+
+    await check('parlor_identity_ticket：参数与远端失败分支文案互不混淆', async () => {
+      assert.ok(ticketTool, '工具列表里必须有 parlor_identity_ticket')
+      const realFetch = globalThis.fetch
+      let calls = 0
+      const respond = (status, body) => { globalThis.fetch = async () => { calls += 1; return new Response(body, { status }) } }
+      try {
+        const badTtl = await ticketTool.execute({ ttl: 0 }, {})
+        assert.equal(badTtl.ok, false)
+        assert.ok(badTtl.message.includes('ttl'), badTtl.message)
+        assert.equal(calls, 0, 'ttl 非法时不得发请求')
+
+        respond(503, '{}')
+        const down = await ticketTool.execute({}, {})
+        assert.equal(down.ok, false)
+        assert.ok(down.message.includes('HTTP 503') && down.message.includes('暂时不可用'), down.message)
+
+        respond(400, '{}')
+        const rejected = await ticketTool.execute({}, {})
+        assert.equal(rejected.ok, false)
+        assert.ok(rejected.message.includes('HTTP 400') && rejected.message.includes('被拒绝'), rejected.message)
+
+        respond(200, '{"token":""}')
+        const malformed = await ticketTool.execute({}, {})
+        assert.equal(malformed.ok, false)
+        assert.ok(malformed.message.includes('格式不正确'), malformed.message)
+        assert.equal(calls, 3)
+      } finally {
+        globalThis.fetch = realFetch
+      }
+    })
+
+    await check('parlor_identity_ticket：expiresAt 必须是有限毫秒正数，0 / "" / 非数字串一律拒绝', async () => {
+      const realFetch = globalThis.fetch
+      let calls = 0
+      const respond = (body) => {
+        globalThis.fetch = async () => {
+          calls += 1
+          return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+      }
+      try {
+        // 上游违约值：0、空串、非数字串、数字串都必须拒绝，不得产出「剩余 0 秒的 1970 年票」。
+        const bad = [
+          { token: TICKET_TOKEN, expiresAt: 0 },
+          { token: TICKET_TOKEN, expiresAt: '' },
+          { token: TICKET_TOKEN, expiresAt: 'abc' },
+          { token: TICKET_TOKEN, expiresAt: '1760000000000' },
+        ]
+        let expected = 0
+        for (const body of bad) {
+          respond(body)
+          expected += 1
+          const r = await ticketTool.execute({}, {})
+          assert.equal(r.ok, false, `expiresAt 不合法时必须失败：${JSON.stringify(body.expiresAt)}`)
+          assert.ok(r.message.includes('格式不正确'), r.message)
+          assert.equal(calls, expected, 'expiresAt 不合法时不得重试换票')
+          assert.ok(!r.message.includes('剩余'), '格式不正确时不得产出剩余秒数文案')
+        }
+      } finally {
+        globalThis.fetch = realFetch
+      }
+    })
+
+    await check('parlor_identity_ticket：成功换票返回真票、缓存/ttl/并发去重', async () => {
+      const realFetch = globalThis.fetch
+      const calls = []
+      const issuedShort = Date.now() + 30_000
+      const issued = Date.now() + 30 * 60_000
+      // 服务端到期时间可改：并发去重段先用短票（剩余不足 60 秒），随后改回长票覆盖「重换 -> 复用」路径。
+      let serverExpiresAt = issuedShort
+      globalThis.fetch = async (url, init) => {
+        calls.push({ url, init })
+        return new Response(JSON.stringify({
+          token: TICKET_TOKEN,
+          expiresAt: serverExpiresAt,
+          person: { cooId: 'selftest-coo-0001', handle: 'selftest', name: 'Selftest Seat', kind: 'bot' },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      const secretsFile = path.join(mockApi.dataDir('cortico'), 'secrets.json')
+      const secretsBefore = fs.readFileSync(secretsFile, 'utf8')
+      let stored = 0, persisted = 0
+      const origStore = adapter.ctx.storeSecret, origPersist = adapter.ctx.persist
+      adapter.ctx.storeSecret = (...a) => { stored += 1; return origStore(...a) }
+      adapter.ctx.persist = (...a) => { persisted += 1; return origPersist(...a) }
+      const prevTarget = config.targetChat
+      const logCount = logs.length, pushCount = pushCalls.length
+      try {
+        config.targetChat = 'private:12345'
+        // 换票只依赖身份文件，不需要席位：客厅未连接也必须能换到真票。
+        adapter.state.lastError = '模拟网络不可用'
+        // 并发去重：三路同时调用只发一次 POST（缓存为空，必然要换票）。
+        const parallel = await Promise.all([
+          ticketTool.execute({}, {}),
+          ticketTool.execute({}, {}),
+          ticketTool.execute({}, {}),
+        ])
+        for (const p of parallel) assert.ok(p.ok && p.message.includes(TICKET_TOKEN), p.message)
+        assert.equal(calls.length, 1, '并发调用必须去重成一次 POST')
+
+        const r = parallel[0]
+        assert.equal(r.ok, true, `换票失败：${r.message}`)
+        assert.ok(r.message.includes(TICKET_TOKEN), '工具返回值必须给出未被脱敏的真票')
+        assert.ok(r.message.includes(nowIso(tzName, new Date(issuedShort))), '返回值必须给出 expiresAt')
+        assert.ok(/约剩余 \d+ 秒/.test(r.message), '返回值必须给出剩余秒数')
+        assert.ok(r.message.includes('selftest') && r.message.includes('Selftest Seat'), '返回值必须带 person.handle / person.name')
+        assert.ok(r.message.includes('x-parlor-identity') && r.message.includes('Authorization'), '返回值必须给出携带方式提示')
+        assert.ok(!r.message.includes('[已隐藏]'), '真票不得被任何脱敏规则遮住')
+
+        assert.equal(calls.length, 1, '一次调用只发一次 POST')
+        assert.equal(calls[0].url, 'https://parlor.example.invalid/v1/identity/session')
+        assert.equal(calls[0].init.method, 'POST')
+        assert.equal(calls[0].init.redirect, 'error')
+        assert.ok(!('authorization' in calls[0].init.headers) && !('x-parlor-identity' in calls[0].init.headers),
+          '换票请求不得带 Authorization 或已有的身份票头')
+        const sent = JSON.parse(calls[0].init.body)
+        assert.equal(sent.cooId, 'selftest-coo-0001')
+        assert.equal(sent.cooSecret, FAKE.secret)
+        assert.equal(sent.name, 'Coo', '缺省席位名应回落到 Coo')
+        assert.equal(sent.audience, 'https://parlor.example.invalid')
+        assert.equal(sent.invite, 'fake-config-invite-selftest', 'invite 优先取 config.json 的 inviteCode')
+
+        // 缓存里的短票（服务端只给了 30 秒）剩余不足 60 秒，必须重换；改回长有效期后拿到的是长票。
+        serverExpiresAt = issued
+        const renewed = await ticketTool.execute({}, {})
+        assert.equal(renewed.ok, true, renewed.message)
+        assert.equal(calls.length, 2, '缓存票剩余不足 60 秒时必须重换票')
+
+        // 缓存：同一时刻再调一次不再发请求。
+        const again = await ticketTool.execute({}, {})
+        assert.equal(again.ok, true)
+        assert.ok(again.message.includes(TICKET_TOKEN))
+        assert.equal(calls.length, 2, '缓存有效时不得重复换票')
+
+        // ttl 只约束本次返回值宣称的可用窗口：缓存票仍有效，不得因此重换。
+        const shortTtl = await ticketTool.execute({ ttl: 60 }, {})
+        assert.equal(shortTtl.ok, true, shortTtl.message)
+        assert.equal(calls.length, 2, 'ttl 只收窄返回值窗口，不得因此重换票')
+        const shortRemain = /约剩余 (\d+) 秒/.exec(shortTtl.message)
+        assert.ok(shortRemain, shortTtl.message)
+        assert.ok(Number(shortRemain[1]) > 0 && Number(shortRemain[1]) <= 60, `ttl:60 必须把剩余秒数夹到 60 以内：${shortTtl.message}`)
+        // 极小 ttl 同样不得重换，剩余秒数夹到 0（不得出现负数）。
+        const tinyTtl = await ticketTool.execute({ ttl: 0.001 }, {})
+        assert.equal(tinyTtl.ok, true, tinyTtl.message)
+        assert.equal(calls.length, 2, 'ttl 过小也不得触发重换票')
+        assert.ok(/约剩余 0 秒/.test(tinyTtl.message), tinyTtl.message)
+
+        // 不给 ttl 时完全跟随服务端 expiresAt：上一张还在有效期内，直接复用。
+        await ticketTool.execute({}, {})
+        assert.equal(calls.length, 2, '无 ttl 时应继续复用同一张票')
+
+        // 真票不得进入 QQ 正文：严格级脱敏仍会遮掉高熵串。
+        const beforePush = pushCalls.length
+        await adapter.host.pushEvent({ type: 'parlor.custom', text: `票 ${TICKET_TOKEN}` }, {})
+        assert.equal(pushCalls.length, beforePush + 1)
+        assert.ok(!String(pushCalls.at(-1).content[0].text).includes(TICKET_TOKEN), 'QQ 正文不得出现真票')
+      } finally {
+        globalThis.fetch = realFetch
+        adapter.ctx.storeSecret = origStore
+        adapter.ctx.persist = origPersist
+        adapter.state.lastError = null
+        config.targetChat = prevTarget
+      }
+      assert.equal(stored, 0, '换票不得调用 storeSecret')
+      assert.equal(persisted, 0, '换票不得调用 persist')
+      const secretsAfter = fs.readFileSync(secretsFile, 'utf8')
+      assert.equal(secretsAfter, secretsBefore, '换票不得改写自有 secrets.json')
+      assert.ok(!secretsAfter.includes(TICKET_TOKEN), '真票不得落进 secrets.json')
+      assert.ok(!logs.slice(logCount).join('\n').includes(TICKET_TOKEN), '日志不得出现真票')
+      assert.ok(!JSON.stringify(pushCalls.slice(pushCount)).includes(TICKET_TOKEN), '推送内容不得出现真票')
+    })
+
+    await check('parlor_identity_ticket：非纯 origin 的会馆地址直接失败', async () => {
+      const cfgFile = path.join(companion, 'config.json')
+      const backup = fs.readFileSync(cfgFile, 'utf8')
+      const realFetch = globalThis.fetch
+      let fetched = 0
+      globalThis.fetch = async () => { fetched += 1; return new Response('{}', { status: 200 }) }
+      try {
+        for (const parlor of [
+          { identityUrl: 'https://parlor.example.invalid/v1/identity', serverUrl: 'https://parlor.example.invalid' },
+          { identityUrl: 'http://parlor.example.invalid', serverUrl: 'https://parlor.example.invalid' },
+        ]) {
+          fs.writeFileSync(cfgFile, JSON.stringify({ worlds: { parlor: { ...parlor, inviteCode: 'fake-config-invite-selftest' } } }))
+          const r = await ticketTool.execute({}, {})
+          assert.equal(r.ok, false, `地址不合法时必须失败：${parlor.identityUrl}`)
+          assert.ok(r.message.includes('不合法'), r.message)
+        }
+        assert.equal(fetched, 0, '地址不合法时不得发请求')
+      } finally {
+        fs.writeFileSync(cfgFile, backup)
+        globalThis.fetch = realFetch
+      }
+    })
+
+    await check('parlor_identity_ticket：缺 inviteCode 明确失败且不发请求', async () => {
+      const noInvite = await createAdapter({
+        api: makeApiUnder('noinvite-data'), settings: { ...config }, overrides: { coopanionHome: noInviteHome, pluginDir },
+      })
+      const realFetch = globalThis.fetch
+      let fetched = 0
+      globalThis.fetch = async () => { fetched += 1; return new Response('{}', { status: 200 }) }
+      try {
+        const tool = noInvite.tools.find((t) => t.name === 'parlor_identity_ticket')
+        assert.ok(tool, '缺邀请码实例同样要注册换票工具')
+        const r = await tool.execute({}, {})
+        assert.equal(r.ok, false)
+        assert.ok(r.message.includes('未配置邀请码') && r.message.includes('inviteCode'), r.message)
+        assert.equal(fetched, 0, '缺邀请码时不得联网换票')
+      } finally {
+        globalThis.fetch = realFetch
+        await noInvite.stop()
+        noInvite.releaseHooks()
+      }
+    })
+
+    // ---- 启动前席位自愈：游标规范化 + 远端残留席位的换房/释放（全程注入 fetch，绝不联网）----
+    // 这 4 个用例强制用假插件，不跟随本机是否装了真实插件：假插件的 serverUrl 是
+    // https://example.invalid，/v1/me 等都在这个源上；换票地址来自 Coopanion config.json 的
+    // worlds.parlor.identityUrl（parlor.example.invalid）。真实插件的 cfg.serverUrl 是它自己的
+    // 默认会馆（https://parlor.com.cn），会让请求原点与 RECOVERY_BASE 不一致而误报未预期请求。
+    const RECOVERY_PLUGIN = makeFakePlugin()
+    const RECOVERY_BASE = 'https://example.invalid'
+    const RECOVERY_TICKET = 'tkt_Recovery0123456789AbCdEfGhIjKlMnOpQr'
+    const OLD_SEAT = 'old-seat-token-selftest'
+    const NEW_SEAT = 'new-seat-token-selftest'
+    const jsonOut = (body, status = 200) =>
+      new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+    const ME_SEAT = (room) => ({ cooId: 'selftest-coo-0001', seat: { room, id: 's-1', name: 'Coo', kind: 'pet', tier: 'digest' }, rooms: [{ id: 'r-old', name: '旧客厅' }, { id: 'r-target', name: '目标客厅' }] })
+    /** 每个用例独立 dataDir 根：secrets/游标互不污染，staged 包 URL 也不会撞 ESM 缓存。 */
+    const makeRecoveryApi = (rootName) => makeApiUnder(rootName)
+
+    await check('席位自愈：游标 current 纠正为目标客厅，预检异常不阻塞启动', async () => {
+      const api = makeRecoveryApi('recover-cursor')
+      const dataDir = api.dataDir('cortico')
+      const cursorFile = path.join(dataDir, 'parlor-cursor.json')
+      fs.writeFileSync(cursorFile, JSON.stringify({
+        version: 3, server: RECOVERY_BASE, current: 'hall',
+        rooms: { hall: 7 }, announcements: ['ann-1'], news: { publishAt: 1760000000000, id: 'news-1' },
+      }))
+      const realFetch = globalThis.fetch
+      // 预检整体失败（换票就炸）：只允许告警，启动照原流程完成。
+      globalThis.fetch = async () => { throw new Error('selftest: 预检不得阻塞启动') }
+      let inst = null
+      try {
+        inst = await createAdapter({
+          api, settings: { ...config, room: 'r-target' },
+          overrides: { coopanionHome: fakeHome, pluginDir: RECOVERY_PLUGIN },
+        })
+        await inst.start()
+        assert.equal(inst.state.started, true, '预检异常不得让启动失败')
+        assert.equal(inst.state.lastError, null)
+        const raw = JSON.parse(fs.readFileSync(cursorFile, 'utf8'))
+        assert.equal(raw.current, 'r-target', '游标 current 必须被纠正为目标客厅')
+        assert.deepEqual(raw.rooms, { hall: 7 }, '游标其它字段必须原样保留')
+        assert.deepEqual(raw.announcements, ['ann-1'])
+        assert.equal(raw.news.publishAt, 1760000000000)
+        assert.equal(inst.ctx.secret('PARLOR_CURRENT_ROOM'), 'r-target', '客厅号秘密必须指向目标客厅')
+        const secrets = JSON.parse(fs.readFileSync(path.join(dataDir, 'secrets.json'), 'utf8'))
+        assert.equal(secrets.PARLOR_CURRENT_ROOM, 'r-target')
+      } finally {
+        globalThis.fetch = realFetch
+        if (inst) { await inst.stop(); inst.releaseHooks() }
+      }
+    })
+
+    await check('席位自愈：游标属于另一个会馆 → 跳过 current 改写，客厅号仍然写入目标客厅', async () => {
+      const api = makeRecoveryApi('recover-cursor-foreign')
+      const dataDir = api.dataDir('cortico')
+      const cursorFile = path.join(dataDir, 'parlor-cursor.json')
+      // 上游 world.ts 对 server 与当前会馆不一致的游标整份作废：改了也不会被读，因此必须原样保留。
+      const cursor = {
+        version: 3, server: 'https://other-hall.invalid', current: 'hall',
+        rooms: { hall: 7 }, announcements: ['ann-1'], news: { publishAt: 1760000000000, id: 'news-1' },
+      }
+      fs.writeFileSync(cursorFile, JSON.stringify(cursor))
+      const realFetch = globalThis.fetch
+      // 预检整体失败（换票就炸）：本用例只关心游标/客厅号，启动本身必须照原流程完成。
+      globalThis.fetch = async () => { throw new Error('selftest: 预检不得阻塞启动') }
+      let inst = null
+      const before = logs.length
+      try {
+        inst = await createAdapter({
+          api, settings: { ...config, room: 'r-target' },
+          overrides: { coopanionHome: fakeHome, pluginDir: RECOVERY_PLUGIN },
+        })
+        await inst.start()
+        assert.equal(inst.state.started, true, inst.state.lastError || '')
+        assert.deepEqual(JSON.parse(fs.readFileSync(cursorFile, 'utf8')), cursor,
+          '游标属于另一个会馆时不得改写 current（整份字段都必须原样保留）')
+        assert.equal(JSON.parse(fs.readFileSync(cursorFile, 'utf8')).current, 'hall')
+        // 只改游标不写客厅号时，每次启动都会被旧游标拉回去：这段写入与游标归属无关，必须照旧。
+        assert.equal(inst.ctx.secret('PARLOR_CURRENT_ROOM'), 'r-target', '客厅号秘密必须仍指向目标客厅')
+        assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'secrets.json'), 'utf8')).PARLOR_CURRENT_ROOM, 'r-target')
+        const after = logs.slice(before)
+        assert.ok(after.some((l) => l.includes('游标属于另一个会馆') && l.includes('已跳过 current 改写')),
+          `必须明确跳过原因：${after.join(' | ')}`)
+        assert.ok(after.some((l) => l.includes('游标属于另一个会馆') && l.includes('r-target')), '跳过日志必须带目标客厅')
+        assert.ok(!after.some((l) => l.includes('客厅游标已指向目标客厅')), '不得谎报游标已改写')
+      } finally {
+        globalThis.fetch = realFetch
+        if (inst) { await inst.stop(); inst.releaseHooks() }
+      }
+    })
+
+    await check('席位自愈：旧令牌有效且真实客厅≠目标 → switch 并写回新令牌', async () => {
+      const api = makeRecoveryApi('recover-switch')
+      const dataDir = api.dataDir('cortico')
+      fs.writeFileSync(path.join(dataDir, 'secrets.json'), JSON.stringify({ PARLOR_SEAT_TOKEN: OLD_SEAT }))
+      // 旧游标里还写着 hall：换房成功后必须一起纠正成目标客厅，否则下次启动又被拉回去。
+      fs.writeFileSync(path.join(dataDir, 'parlor-cursor.json'), JSON.stringify({
+        version: 3, server: RECOVERY_BASE, current: 'hall', rooms: {}, announcements: [], news: { publishAt: 0, id: '' },
+      }))
+      const calls = []
+      const realFetch = globalThis.fetch
+      globalThis.fetch = async (url, init) => {
+        const u = String(url)
+        calls.push({ url: u, init })
+        if (u === 'https://parlor.example.invalid/v1/identity/session') {
+          return jsonOut({ token: RECOVERY_TICKET, expiresAt: Date.now() + 600_000, person: { cooId: 'selftest-coo-0001', handle: 'selftest' } })
+        }
+        if (u === `${RECOVERY_BASE}/v1/me`) return jsonOut(ME_SEAT('r-old'))
+        if (u === `${RECOVERY_BASE}/v1/me/location`) return jsonOut({ room: 'r-old', seat: ME_SEAT('r-old').seat })
+        if (u === `${RECOVERY_BASE}/v1/rooms/r-old/switch`) {
+          return jsonOut({ ok: true, room: 'r-target', seat: ME_SEAT('r-target').seat, token: NEW_SEAT, leaveSeq: 3, joinSeq: 4 })
+        }
+        throw new Error(`selftest: 未预期请求 ${u}`)
+      }
+      let inst = null
+      try {
+        inst = await createAdapter({
+          api, settings: { ...config, room: 'r-target' },
+          overrides: { coopanionHome: fakeHome, pluginDir: RECOVERY_PLUGIN },
+        })
+        await inst.start()
+        assert.equal(inst.state.started, true, inst.state.lastError || '')
+        assert.equal(inst.ctx.secret('PARLOR_SEAT_TOKEN'), NEW_SEAT, 'switch 返回的新令牌必须写回')
+        const secrets = JSON.parse(fs.readFileSync(path.join(dataDir, 'secrets.json'), 'utf8'))
+        assert.equal(secrets.PARLOR_SEAT_TOKEN, NEW_SEAT)
+        assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'parlor-cursor.json'), 'utf8')).current, 'r-target')
+
+        const byPath = (p) => calls.find((c) => c.url.endsWith(p))
+        const me = byPath('/v1/me')
+        assert.equal(me.init.headers['x-parlor-identity'], RECOVERY_TICKET)
+        assert.equal(me.init.headers.authorization, undefined, '/v1/me 带身份票时不得再带 authorization')
+        const loc = byPath('/v1/me/location')
+        assert.equal(loc.init.headers.authorization, `Bearer ${OLD_SEAT}`, 'location 必须用本地令牌探测')
+        assert.equal(loc.init.headers['x-parlor-identity'], undefined, 'location 只认 Bearer')
+        const sw = byPath('/v1/rooms/r-old/switch')
+        assert.equal(sw.init.method, 'POST')
+        assert.equal(sw.init.headers.authorization, `Bearer ${OLD_SEAT}`)
+        assert.deepEqual(JSON.parse(sw.init.body), { to: 'r-target', name: 'Coo' })
+        assert.equal(calls.length, 4, `只应发出换票/查位/定位/换房 4 个请求：${calls.map((c) => c.url).join(',')}`)
+        assert.ok(!logs.some((l) => l.includes(OLD_SEAT) || l.includes(NEW_SEAT)), '日志不得出现席位令牌')
+      } finally {
+        globalThis.fetch = realFetch
+        if (inst) { await inst.stop(); inst.releaseHooks() }
+      }
+    })
+
+    // switch 回包不确定（非 2xx / 2xx 却缺 token）时不能直接当「换房失败」：旧令牌可能已被服务端作废，
+    // 必须先重读 /v1/me 再决定 leave 哪个客厅。这两条用例分别钉住「重读仍在原客厅 → 只释放原客厅」与
+    // 「重读已在目标客厅 → 只释放目标客厅（这条会真的改远端状态，没有回归保护最危险）」。
+    await check('席位自愈：switch 报错且重读仍在原客厅 → 只释放原客厅席位', async () => {
+      const api = makeRecoveryApi('recover-switch-uncertain-same')
+      const dataDir = api.dataDir('cortico')
+      fs.writeFileSync(path.join(dataDir, 'secrets.json'), JSON.stringify({ PARLOR_SEAT_TOKEN: OLD_SEAT }))
+      const calls = []
+      const realFetch = globalThis.fetch
+      globalThis.fetch = async (url, init) => {
+        const u = String(url)
+        calls.push({ url: u, init })
+        if (u === 'https://parlor.example.invalid/v1/identity/session') {
+          return jsonOut({ token: RECOVERY_TICKET, expiresAt: Date.now() + 600_000, person: {} })
+        }
+        // 首次查位与换房后的重读都报原客厅：服务端确实没换成功。
+        if (u === `${RECOVERY_BASE}/v1/me`) return jsonOut(ME_SEAT('r-old'))
+        if (u === `${RECOVERY_BASE}/v1/me/location`) return jsonOut({ room: 'r-old', seat: ME_SEAT('r-old').seat })
+        if (u === `${RECOVERY_BASE}/v1/rooms/r-old/switch`) return jsonOut({ error: '服务端内部错误' }, 500)
+        // 换房没生效 → 旧令牌仍然有效，leave 一次就够（不得再走身份票重试）。
+        if (u === `${RECOVERY_BASE}/v1/rooms/r-old/leave`) return jsonOut({ ok: true, seq: 10, at: '2026-01-01T00:00:00.000Z' })
+        throw new Error(`selftest: 未预期请求 ${u}`)
+      }
+      let inst = null
+      const before = logs.length
+      try {
+        inst = await createAdapter({
+          api, settings: { ...config, room: 'r-target' },
+          overrides: { coopanionHome: fakeHome, pluginDir: RECOVERY_PLUGIN },
+        })
+        await inst.start()
+        assert.equal(inst.state.started, true, inst.state.lastError || '')
+        assert.deepEqual(calls.map((c) => c.url), [
+          'https://parlor.example.invalid/v1/identity/session',
+          `${RECOVERY_BASE}/v1/me`,
+          `${RECOVERY_BASE}/v1/me/location`,
+          `${RECOVERY_BASE}/v1/rooms/r-old/switch`,
+          `${RECOVERY_BASE}/v1/me`,
+          `${RECOVERY_BASE}/v1/rooms/r-old/leave`,
+        ], `请求序列必须是「换票→查位→定位→换房→重读→释放原客厅」：${calls.map((c) => c.url).join(',')}`)
+        const reread = calls[4]
+        assert.equal(reread.init.headers['x-parlor-identity'], RECOVERY_TICKET, '重读 /v1/me 必须用身份票')
+        assert.equal(reread.init.headers.authorization, undefined, '重读不得带可能已失效的旧令牌')
+        const leaves = calls.filter((c) => c.url.endsWith('/leave'))
+        assert.equal(leaves.length, 1, `旧令牌仍有效时 leave 只发 1 次：${leaves.map((c) => c.url).join(',')}`)
+        assert.ok(leaves[0].url.endsWith('/v1/rooms/r-old/leave'), `leave 必须指向原客厅：${leaves[0].url}`)
+        assert.equal(leaves[0].init.method, 'POST')
+        assert.equal(leaves[0].init.headers.authorization, `Bearer ${OLD_SEAT}`)
+        assert.equal(leaves[0].init.headers['x-parlor-identity'], undefined, '首选旧令牌路径不得带身份票')
+        assert.ok(!calls.some((c) => c.url.includes('/v1/rooms/r-target/')), '重读仍报原客厅时绝不能对目标客厅动手')
+        assert.equal(inst.ctx.secret('PARLOR_SEAT_TOKEN'), '', '释放成功后必须清空旧令牌，让上游重新入座')
+        assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'secrets.json'), 'utf8')).PARLOR_SEAT_TOKEN, '')
+        const after = logs.slice(before)
+        assert.ok(after.some((l) => l.includes('换房 HTTP 500')), `必须留下换房失败原因：${after.join(' | ')}`)
+        assert.ok(after.some((l) => l.includes('已释放客厅 r-old')), '必须留下释放原客厅的日志')
+        assert.ok(!after.some((l) => l.includes('换房疑似已生效')), '重读仍报原客厅时不得声称换房已生效')
+        assert.ok(!after.join('\n').includes(OLD_SEAT), '日志不得出现旧令牌')
+      } finally {
+        globalThis.fetch = realFetch
+        if (inst) { await inst.stop(); inst.releaseHooks() }
+      }
+    })
+
+    await check('席位自愈：switch 回包丢失但重读已在目标客厅 → 只释放目标客厅并清空令牌', async () => {
+      // 两种「回包丢失」形态都必须落进同一条 switchUncertain 路径：
+      //   ① 500（其实换好了）；② 200 却没有 token（直接证据：2xx 缺 token 也要重读）。
+      const variants = [
+        { label: 'HTTP 500', reply: () => jsonOut({ error: '服务端内部错误' }, 500), detail: '换房 HTTP 500' },
+        {
+          label: '2xx 缺 token',
+          reply: () => jsonOut({ ok: true, room: 'r-target', seat: ME_SEAT('r-target').seat, leaveSeq: 3, joinSeq: 4 }),
+          detail: '换房成功但服务端未返回新席位令牌',
+        },
+      ]
+      for (const [i, variant] of variants.entries()) {
+        const api = makeRecoveryApi(`recover-switch-uncertain-moved-${i}`)
+        const dataDir = api.dataDir('cortico')
+        fs.writeFileSync(path.join(dataDir, 'secrets.json'), JSON.stringify({ PARLOR_SEAT_TOKEN: OLD_SEAT }))
+        const calls = []
+        let meReads = 0
+        const realFetch = globalThis.fetch
+        globalThis.fetch = async (url, init) => {
+          const u = String(url)
+          calls.push({ url: u, init })
+          if (u === 'https://parlor.example.invalid/v1/identity/session') {
+            return jsonOut({ token: RECOVERY_TICKET, expiresAt: Date.now() + 600_000, person: {} })
+          }
+          if (u === `${RECOVERY_BASE}/v1/me`) {
+            // 首次查位：还在原客厅；switch 之后的重读：服务端其实已经换到目标客厅。
+            meReads += 1
+            return jsonOut(ME_SEAT(meReads === 1 ? 'r-old' : 'r-target'))
+          }
+          if (u === `${RECOVERY_BASE}/v1/me/location`) return jsonOut({ room: 'r-old', seat: ME_SEAT('r-old').seat })
+          if (u === `${RECOVERY_BASE}/v1/rooms/r-old/switch`) return variant.reply()
+          // 换房其实已生效 → 旧令牌已被服务端作废，只有身份票能释放。
+          if (u === `${RECOVERY_BASE}/v1/rooms/r-target/leave`) {
+            if (init.headers.authorization) return jsonOut({ error: '席位令牌无效或已经离开' }, 401)
+            return jsonOut({ ok: true, seq: 11, at: '2026-01-01T00:00:00.000Z' })
+          }
+          throw new Error(`selftest: 未预期请求 ${u}`)
+        }
+        let inst = null
+        const before = logs.length
+        try {
+          inst = await createAdapter({
+            api, settings: { ...config, room: 'r-target' },
+            overrides: { coopanionHome: fakeHome, pluginDir: RECOVERY_PLUGIN },
+          })
+          // 启动仍失败时摘要要拼进错误文案：这里直接用摘要文案验证「换房疑似已生效」而非「换房失败」。
+          inst.world.start = async () => { throw new Error('你已经在另一个客厅里；先离开或换房') }
+          await inst.start()
+          assert.equal(inst.state.started, false, `${variant.label}：world 启动应失败`)
+          assert.deepEqual(calls.map((c) => c.url), [
+            'https://parlor.example.invalid/v1/identity/session',
+            `${RECOVERY_BASE}/v1/me`,
+            `${RECOVERY_BASE}/v1/me/location`,
+            `${RECOVERY_BASE}/v1/rooms/r-old/switch`,
+            `${RECOVERY_BASE}/v1/me`,
+            `${RECOVERY_BASE}/v1/rooms/r-target/leave`,
+            `${RECOVERY_BASE}/v1/rooms/r-target/leave`,
+          ], `${variant.label}：重读确认已在目标客厅后只允许「释放目标客厅 + 身份票重试」：${calls.map((c) => c.url).join(',')}`)
+          assert.equal(calls[4].init.headers['x-parlor-identity'], RECOVERY_TICKET, '重读 /v1/me 必须用身份票')
+          assert.equal(calls[4].init.headers.authorization, undefined, '重读不得带可能已失效的旧令牌')
+          const leaves = calls.filter((c) => c.url.endsWith('/leave'))
+          assert.equal(leaves.length, 2, '旧令牌被作废后必须用身份票重试一次')
+          assert.ok(leaves.every((c) => c.url.endsWith('/v1/rooms/r-target/leave')),
+            `leave 必须全部指向目标客厅：${leaves.map((c) => c.url).join(',')}`)
+          assert.ok(!calls.some((c) => c.url.includes('/v1/rooms/r-old/leave')), '换房疑似已生效时绝不能释放原客厅')
+          assert.equal(leaves[0].init.headers.authorization, `Bearer ${OLD_SEAT}`)
+          assert.equal(leaves[1].init.headers['x-parlor-identity'], RECOVERY_TICKET)
+          assert.equal(leaves[1].init.headers.authorization, undefined, '身份票重试不得再带旧令牌')
+          assert.equal(inst.ctx.secret('PARLOR_SEAT_TOKEN'), '', '令牌最终必须被清空')
+          assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'secrets.json'), 'utf8')).PARLOR_SEAT_TOKEN, '')
+          // 摘要文案（经 seatConflictHint 落到 lastError）：真实席位已改判到目标客厅，且措辞是「疑似已生效」。
+          assert.ok(inst.state.lastError.includes('换房疑似已生效、回包丢失'), inst.state.lastError)
+          assert.ok(inst.state.lastError.includes('r-target') && inst.state.lastError.includes('目标客厅'), inst.state.lastError)
+          assert.ok(!inst.state.lastError.includes('r-old'), `摘要不得再指向原客厅：${inst.state.lastError}`)
+          assert.ok(!inst.state.lastError.includes('换房失败'), `不得把回包丢失报成换房失败：${inst.state.lastError}`)
+          const after = logs.slice(before)
+          assert.ok(after.some((l) => l.includes('换房疑似已生效、回包丢失') && l.includes('r-target')),
+            `必须留下「疑似已生效」的日志：${after.join(' | ')}`)
+          assert.ok(after.some((l) => l.includes(variant.detail)),
+            `${variant.label} 必须留下原始失败原因「${variant.detail}」：${after.join(' | ')}`)
+          assert.ok(!after.some((l) => l.includes('换房失败')), '日志不得出现「换房失败」')
+          assert.ok(!after.join('\n').includes(OLD_SEAT), '日志不得出现旧令牌')
+        } finally {
+          globalThis.fetch = realFetch
+          if (inst) { await inst.stop(); inst.releaseHooks() }
+        }
+      }
+    })
+
+    await check('席位自愈：本地令牌 401 → 先用旧令牌、再用身份票释放并清空令牌', async () => {
+      const api = makeRecoveryApi('recover-leave')
+      const dataDir = api.dataDir('cortico')
+      fs.writeFileSync(path.join(dataDir, 'secrets.json'),
+        JSON.stringify({ PARLOR_SEAT_TOKEN: OLD_SEAT, PARLOR_OWNER_TOKEN: 'fake-owner-recover-selftest' }))
+      const calls = []
+      const realFetch = globalThis.fetch
+      globalThis.fetch = async (url, init) => {
+        const u = String(url)
+        calls.push({ url: u, init })
+        if (u === 'https://parlor.example.invalid/v1/identity/session') {
+          return jsonOut({ token: RECOVERY_TICKET, expiresAt: Date.now() + 600_000, person: {} })
+        }
+        if (u === `${RECOVERY_BASE}/v1/me`) return jsonOut(ME_SEAT('r-old'))
+        if (u === `${RECOVERY_BASE}/v1/me/location`) return jsonOut({ error: '席位令牌无效或已经离开' }, 401)
+        if (u === `${RECOVERY_BASE}/v1/rooms/r-old/leave`) {
+          // ① 带旧令牌一律 401；② 身份票重试成功。
+          if (init.headers.authorization) return jsonOut({ error: '席位令牌无效或已经离开' }, 401)
+          return jsonOut({ ok: true, seq: 9, at: '2026-01-01T00:00:00.000Z' })
+        }
+        throw new Error(`selftest: 未预期请求 ${u}`)
+      }
+      let inst = null
+      try {
+        inst = await createAdapter({
+          api, settings: { ...config, room: 'r-target' },
+          overrides: { coopanionHome: fakeHome, pluginDir: RECOVERY_PLUGIN },
+        })
+        await inst.start()
+        assert.equal(inst.state.started, true, inst.state.lastError || '')
+        const leaves = calls.filter((c) => c.url.endsWith('/v1/rooms/r-old/leave'))
+        assert.equal(leaves.length, 2, '旧令牌释放失败后必须用身份票重试一次')
+        assert.equal(leaves[0].init.headers.authorization, `Bearer ${OLD_SEAT}`)
+        assert.equal(leaves[1].init.headers['x-parlor-identity'], RECOVERY_TICKET)
+        assert.equal(leaves[1].init.headers.authorization, undefined, '身份票重试不得再带旧令牌')
+        assert.equal(inst.ctx.secret('PARLOR_SEAT_TOKEN'), '', '释放成功后必须清空旧令牌，让上游重新入座')
+        const secrets = JSON.parse(fs.readFileSync(path.join(dataDir, 'secrets.json'), 'utf8'))
+        assert.equal(secrets.PARLOR_SEAT_TOKEN, '')
+        assert.equal(secrets.PARLOR_OWNER_TOKEN, 'fake-owner-recover-selftest', '只清席位令牌，不动 owner 令牌')
+      } finally {
+        globalThis.fetch = realFetch
+        if (inst) { await inst.stop(); inst.releaseHooks() }
+      }
+    })
+
+    await check('recoverSeat：内部异常/地址不合法/缺邀请码都只返回 skipped，绝不抛出', async () => {
+      const base = {
+        baseUrl: RECOVERY_BASE,
+        identity: { cooId: 'selftest-coo-0001', cooSecret: FAKE.secret },
+        identitySource: 'https://parlor.example.invalid',
+        invite: 'inv-selftest', seatName: 'Coo', targetRoom: 'r-target',
+        secret: () => '', storeSecret: () => {},
+      }
+      for (const fetchImpl of [
+        () => { throw new Error('网络炸了') },
+        async () => { throw Object.assign(new Error('超时'), { name: 'TimeoutError' }) },
+      ]) {
+        const summary = await recoverSeat({ ...base, fetchImpl })
+        assert.equal(summary.ok, false)
+        assert.equal(summary.action, 'skipped')
+        assert.equal(summary.targetRoom, 'r-target')
+        assert.ok(summary.detail.length > 0, '必须留下降级原因')
+        assert.ok(!summary.detail.includes(FAKE.secret), '降级原因不得泄露身份密钥')
+      }
+      let fetched = 0
+      const countingFetch = async () => { fetched += 1; return jsonOut({}, 200) }
+      const badOrigin = await recoverSeat({ ...base, baseUrl: 'http://parlor.example.invalid/v1', fetchImpl: countingFetch })
+      assert.equal(badOrigin.action, 'skipped')
+      const noInvite = await recoverSeat({ ...base, invite: '', fetchImpl: countingFetch })
+      assert.equal(noInvite.action, 'skipped')
+      assert.equal(fetched, 0, '地址不合法或缺邀请码时不得联网')
+    })
+
+    // 邀请码第三兜底：配置与 .env 都没有 PARLOR_INVITE_CODE 时，只有「目标是公开会馆」才允许用
+    // 包内默认邀请码。两个用例同样强制假插件（pluginDir: RECOVERY_PLUGIN）；假插件默认 serverUrl 是
+    // https://example.invalid，需要公开会馆的那条把活的 cfg.serverUrl 改成 PARLOR_DEFAULT_ORIGIN
+    // （插件实例的 start 是 stub，不读该值），非公开会馆那条保持假插件默认地址。
+    await check('席位自愈：公开会馆且无邀请码配置时，用包内默认邀请码真的发出预检请求', async () => {
+      const api = makeRecoveryApi('recover-public-invite')
+      const calls = []
+      const realFetch = globalThis.fetch
+      globalThis.fetch = async (url, init) => {
+        const u = String(url)
+        calls.push({ url: u, init })
+        if (u === 'https://parlor.example.invalid/v1/identity/session') {
+          return jsonOut({ token: RECOVERY_TICKET, expiresAt: Date.now() + 600_000, person: {} })
+        }
+        if (u === `${PARLOR_DEFAULT_ORIGIN}/v1/me`) return jsonOut({ cooId: 'selftest-coo-0002', seat: null, rooms: [] })
+        if (u === `${PARLOR_DEFAULT_ORIGIN}/v1/me/location`) return jsonOut({ error: '席位令牌无效或已经离开' }, 401)
+        throw new Error(`selftest: 未预期请求 ${u}`)
+      }
+      let inst = null
+      try {
+        inst = await createAdapter({
+          api, settings: { ...config, room: 'r-target' },
+          overrides: { coopanionHome: noInviteHome, pluginDir: RECOVERY_PLUGIN },
+        })
+        inst.ctx.cfg.serverUrl = PARLOR_DEFAULT_ORIGIN
+        await inst.start()
+        assert.equal(inst.state.started, true, inst.state.lastError || '')
+        // 缺邀请码会被 skipped 挡在换票之前，所以「真的发出 3 个请求」本身就是兜底生效的证据。
+        assert.equal(calls.length, 3, `预检必须发出换票/查位/定位 3 个请求：${calls.map((c) => c.url).join(',')}`)
+        assert.ok(calls.some((c) => c.url === 'https://parlor.example.invalid/v1/identity/session'), '换票请求必须真的发出')
+        // 邀请码在换票请求的 body.invite；上游 join 用 x-parlor-invite 头。两种携带方式都检查，不放宽断言。
+        const invites = calls.map((c) => {
+          const header = c.init?.headers?.['x-parlor-invite']
+          if (header !== undefined) return header
+          try { return JSON.parse(String(c.init?.body ?? ''))?.invite } catch { return undefined }
+        }).filter((v) => v !== undefined)
+        assert.ok(invites.length > 0, '预检请求必须携带邀请码')
+        for (const v of invites) assert.equal(v, DEFAULT_INVITE_CODE, `公开会馆必须用包内默认邀请码，实际是 ${v}`)
+        assert.equal(DEFAULT_INVITE_CODE, 'parlor-cPBpxGcsOhzd', '包内默认邀请码必须与上游 0.45.2 同源')
+      } finally {
+        globalThis.fetch = realFetch
+        if (inst) { await inst.stop(); inst.releaseHooks() }
+      }
+    })
+
+    await check('席位自愈：非公开会馆且无邀请码配置时保持 skipped，绝不发请求', async () => {
+      const api = makeRecoveryApi('recover-private-noinvite')
+      let fetched = 0
+      const realFetch = globalThis.fetch
+      globalThis.fetch = async (url) => { fetched += 1; throw new Error(`selftest: 不该联网（${url}）`) }
+      let inst = null
+      const before = logs.length
+      try {
+        inst = await createAdapter({
+          api, settings: { ...config, room: 'r-target' },
+          overrides: { coopanionHome: noInviteHome, pluginDir: RECOVERY_PLUGIN },
+        })
+        // 假插件默认 serverUrl 是 https://example.invalid：不是公开会馆，不能套用包内默认邀请码。
+        await inst.start()
+        assert.equal(inst.state.started, true, inst.state.lastError || '')
+        assert.equal(fetched, 0, '非公开会馆缺邀请码时不得联网')
+        assert.ok(logs.slice(before).some((l) => l.includes('未配置邀请码，已跳过席位自愈预检')), '必须留下跳过原因')
+      } finally {
+        globalThis.fetch = realFetch
+        if (inst) { await inst.stop(); inst.releaseHooks() }
+      }
+    })
+
+    await check('席位自愈：预检挂起期间 stop()，放行后不得再启动 world', async () => {
+      const api = makeRecoveryApi('recover-stop')
+      let releaseGate
+      const gate = new Promise((resolve) => { releaseGate = resolve })
+      let signalStarted
+      const fetchStarted = new Promise((resolve) => { signalStarted = resolve })
+      let fetched = 0
+      const realFetch = globalThis.fetch
+      // 预检请求挂在同一道闸门上：拿到闸门后先挂住，stop() 再放行，模拟「预检最坏 25s」期间热重载 dispose。
+      globalThis.fetch = async (url) => {
+        const u = String(url)
+        fetched += 1
+        signalStarted()
+        await gate
+        if (u === 'https://parlor.example.invalid/v1/identity/session') {
+          return jsonOut({ token: RECOVERY_TICKET, expiresAt: Date.now() + 600_000, person: {} })
+        }
+        if (u === `${RECOVERY_BASE}/v1/me`) return jsonOut({ cooId: 'selftest-coo-0001', seat: null, rooms: [] })
+        if (u === `${RECOVERY_BASE}/v1/me/location`) return jsonOut({ error: '席位令牌无效或已经离开' }, 401)
+        throw new Error(`selftest: 未预期请求 ${u}`)
+      }
+      const unhandled = []
+      const onUnhandled = (err) => unhandled.push(err)
+      process.on('unhandledRejection', onUnhandled)
+      let inst = null
+      try {
+        inst = await createAdapter({
+          api, settings: { ...config, room: 'r-target' },
+          overrides: { coopanionHome: fakeHome, pluginDir: RECOVERY_PLUGIN },
+        })
+        let worldStarts = 0
+        inst.world.start = async () => { worldStarts += 1 }
+        const starting = inst.start()
+        // 失败路径可能来不及 await 它：先挂一个空 catch，避免给本用例留下 unhandledRejection（不影响成功路径的 await 抛错）。
+        starting.catch(() => {})
+        // 超时护栏：预检将来若不再发请求（例如邀请码取值逻辑改动），这里必须判 FAIL，
+        // 不能永久挂起把整个套件拖死（挂起时 finally 也永远不会执行）。
+        let startedGuard = null
+        try {
+          const guard = new Promise((resolve) => { startedGuard = setTimeout(() => resolve('timeout'), 2_000) })
+          const first = await Promise.race([fetchStarted.then(() => 'started'), guard])
+          assert.equal(first, 'started', '2 秒内预检未发出请求，用例判定失败（不再静默等待）')
+        } finally {
+          clearTimeout(startedGuard)
+        }
+        assert.ok(fetched >= 1, '预检必须真的发出请求')
+        await inst.stop()
+        assert.equal(inst.state.stopped, true, 'stop() 必须标记 stopped')
+        releaseGate()
+        await starting
+        assert.equal(worldStarts, 0, '预检期间已 stop()，放行后绝不能再启动 world（否则 SSE/定时器会活过本次实例）')
+        assert.equal(inst.state.started, false)
+        assert.equal(inst.state.lastError, null)
+        // 让出一个宏任务，等 Node 报出可能的未处理拒绝，再断言一条都没有。
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        assert.equal(unhandled.length, 0, `不应留下未处理的拒绝：${unhandled.map((e) => String(e?.message ?? e)).join('；')}`)
+      } finally {
+        releaseGate() // 幂等：断言提前失败时也要放行，别把预检留在挂起状态
+        process.off('unhandledRejection', onUnhandled)
+        globalThis.fetch = realFetch
+        if (inst) inst.releaseHooks()
+      }
+    })
+
+    await check('seatConflictHint：给出真实/目标客厅与自愈动作，不含令牌', () => {
+      const hint = seatConflictHint({
+        ok: false, action: 'leave-failed', targetRoom: 'r-target', targetRoomName: '目标客厅',
+        realRoom: 'r-old', realRoomName: '旧客厅', tokenValid: false, detail: '释放席位 HTTP 403',
+      })
+      assert.ok(hint.includes('r-old') && hint.includes('旧客厅'), hint)
+      assert.ok(hint.includes('r-target') && hint.includes('目标客厅'), hint)
+      assert.ok(hint.includes('释放旧席位失败') && hint.includes('释放席位 HTTP 403'), hint)
+      assert.ok(!hint.includes(OLD_SEAT) && !hint.includes(RECOVERY_TICKET), '补充说明不得含令牌')
+      assert.equal(seatConflictHint(null), '')
+    })
+
+    await check('启动仍报「已经在另一个客厅里」时保留原前缀并追加自愈摘要', async () => {
+      const api = makeRecoveryApi('recover-conflict')
+      const dataDir = api.dataDir('cortico')
+      fs.writeFileSync(path.join(dataDir, 'secrets.json'), JSON.stringify({ PARLOR_SEAT_TOKEN: OLD_SEAT }))
+      const realFetch = globalThis.fetch
+      globalThis.fetch = async (url, init) => {
+        const u = String(url)
+        if (u === 'https://parlor.example.invalid/v1/identity/session') {
+          return jsonOut({ token: RECOVERY_TICKET, expiresAt: Date.now() + 600_000, person: {} })
+        }
+        if (u === `${RECOVERY_BASE}/v1/me`) return jsonOut(ME_SEAT('r-old'))
+        if (u === `${RECOVERY_BASE}/v1/me/location`) return jsonOut({ error: '席位令牌无效或已经离开' }, 401)
+        if (u.endsWith('/leave')) return jsonOut({ error: '没有权限' }, 403)
+        throw new Error(`selftest: 未预期请求 ${u}`)
+      }
+      let inst = null
+      const before = logs.length
+      try {
+        inst = await createAdapter({
+          api, settings: { ...config, room: 'r-target' },
+          overrides: { coopanionHome: fakeHome, pluginDir: RECOVERY_PLUGIN },
+        })
+        // 服务端拒绝并发入座的那条错误：上游不在兼容分支里，会直接上抛。
+        inst.world.start = async () => { throw new Error('你已经在另一个客厅里；先离开或换房') }
+        await inst.start()
+        assert.equal(inst.state.started, false)
+        assert.ok(inst.state.lastError.startsWith('你已经在另一个客厅里'), inst.state.lastError)
+        assert.ok(inst.state.lastError.includes('r-old') && inst.state.lastError.includes('旧客厅'), inst.state.lastError)
+        assert.ok(inst.state.lastError.includes('r-target') && inst.state.lastError.includes('目标客厅'), inst.state.lastError)
+        assert.ok(inst.state.lastError.includes('释放旧席位失败'), inst.state.lastError)
+        assert.ok(!inst.state.lastError.includes(OLD_SEAT), '错误文案不得出现席位令牌')
+        const errorLine = logs.slice(before).find((l) => l.startsWith('error:客厅插件启动失败'))
+        assert.ok(errorLine && errorLine.includes('客厅插件启动失败（网络或远端不可用；模块仍可用，工具会返回未连接提示）：'),
+          '原有错误包装前缀必须保持不变')
+        assert.ok(errorLine.includes('你已经在另一个客厅里'))
+      } finally {
+        globalThis.fetch = realFetch
+        if (inst) inst.releaseHooks()
       }
     })
 
