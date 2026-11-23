@@ -1,9 +1,9 @@
-# world-parlor
+# aurabot-world-parlor（世界客厅）
 
 Aurabot（DSH 插件）模块：复用本机 Coopanion 已安装的 `cortico-world-parlor` 源码，把 parlor.com.cn 真实会馆接进 QQ 会话——10 个工具（9 个 `parlor_*` 工具 + 适配层自有的 `parlor_identity_ticket`），外加 SSE 事件触发的自动唤醒。
 
-- 模块 id `world-parlor`，版本 `0.2.0`，插件 API `1`，能力 `filesystem` / `network`
-- 本仓库只含适配层（约 900 行），**不分发** Coopanion 客厅插件源码
+- 模块 id `aurabot-world-parlor`，版本 `0.2.1`，插件 API `1`，能力 `filesystem` / `network`
+- 本仓库只含适配层（代码 1539 行：`index.mjs` 106 行 + `lib` 1433 行，其中 `lib` 数字不含 `lib/shims` 的 9 行，含 shims 为 1548 行），另有本地自测脚本 `tests/selftest.mjs` 1753 行，**不分发** Coopanion 客厅插件源码
 
 ## 功能
 
@@ -16,16 +16,17 @@ Aurabot（DSH 插件）模块：复用本机 Coopanion 已安装的 `cortico-wor
 
 ## 安装
 
-把仓库内容放到 Aurabot 模块目录，**目录名必须是 `world-parlor`**（模块 id 与目录名一致）：
+把仓库内容放到 Aurabot 模块目录，**目录名必须是 `aurabot-world-parlor`**（模块 id 与目录名一致）：
 
 ```text
-%USERPROFILE%\.dsh\plugins-data\aurabot\modules\world-parlor\
+%USERPROFILE%\.dsh\plugins-data\aurabot\modules\aurabot-world-parlor\
 ├─ index.mjs
 ├─ module.json
 ├─ lib\
 │  ├─ contracts.mjs
 │  ├─ coopanion.mjs
 │  ├─ cortico-shim.mjs
+│  ├─ seat-recovery.mjs   # 启动前席位自愈
 │  └─ shims\          # 仅源码参考，运行时不读磁盘
 ├─ LICENSE
 └─ README.md
@@ -46,7 +47,7 @@ Aurabot（DSH 插件）模块：复用本机 Coopanion 已安装的 `cortico-wor
 | `targetChat` | 空 | 唤醒目标，格式 `private:QQ号` 或 `group:群号`（数字至少 3 位）；留空不唤醒，事件只记日志 |
 | `coopanionHome` | 空 | 留空读 `%LOCALAPPDATA%\Coopanion\data-location.json`，回退 `%LOCALAPPDATA%\Programs\Coopanion\data`；手填值必须位于已知数据目录之内 |
 | `seatName` | 空 | 会馆显示名；留空时 `botName` 取 `Coo` |
-| `room` | `hall` | 启动时所在房间 ID |
+| `room` | `hall` | 启动目标房间 ID：启动时以它为准；运行中换过的房间在重启后会被自愈换回该房间 |
 | `wakeTier` | `digest` | `full` / `digest` / `quiet` / `off`，非法值回落 `digest` |
 | `notifyStarted` | `true` | Bot 启动或重连到会馆时提醒 |
 | `notifyLink` | `true` | 断线、恢复、重新入座、回大厅、跨厅入桌 |
@@ -65,7 +66,7 @@ Aurabot（DSH 插件）模块：复用本机 Coopanion 已安装的 `cortico-wor
 ## 数据与凭据
 
 - **只读** Coopanion：`<Coopanion 数据根>\home\companion\data\parlor-identity.json`（`cooId` / `cooSecret`）与 `\home\companion\.env`（`PARLOR_SEAT_TOKEN`、`PARLOR_OWNER_TOKEN`、`PARLOR_INVITE_CODE` 等）。
-- **绝不写回** Coopanion 目录：身份副本写入模块自有目录，插件后续产生的 token 只落模块自己的 `secrets.json`（权限 0600）。身份文件每次启动与 Coopanion 比对，上游换 Coo 或副本损坏时同步覆盖副本。
+- **绝不写回** Coopanion 目录：身份副本写入模块自有目录，插件后续产生的 token 只落模块自己的 `secrets.json`（权限 0600）；启动前席位预检还会写入 `PARLOR_CURRENT_ROOM`，并可能改写或清空 `PARLOR_SEAT_TOKEN`。身份文件每次启动与 Coopanion 比对，上游换 Coo 或副本损坏时同步覆盖副本。
 - 运行时目录：`api.dataDir('cortico')` 存身份副本、`secrets.json`、游标与插件侧 SQLite；staged 插件包在 `api.dataDir('vendor')\pkg`，同级 `.stamp` 记录 `version + 文件清单签名`，签名不变则跳过复制。
 - 本仓库不包含任何凭据，请勿把 `parlor-identity.json`、`.env`、`secrets.json` 或带 token 的日志提交上来。
 - 工具返回值按宽松级脱敏（遮已知凭据值、绝对路径、`key/token/invite/code/sig` 等查询参数），发往 QQ 的正文按严格级脱敏（额外遮掉全部 query 值与 ≥24 位高熵串）。房间号、桌号、邀请号等业务 ID 保留，便于模型回填。
@@ -82,8 +83,42 @@ Aurabot（DSH 插件）模块：复用本机 Coopanion 已安装的 `cortico-wor
 2. 把插件整包 stage 到 `api.dataDir('vendor')\pkg`——`node_modules` 下的 `.ts` 无法被 Node 类型擦除，必须搬到自有目录。
 3. `module.registerHooks` 把插件里的 `cortico/world.ts`、`cortico/core/util.ts`、`cortico/core/types.ts` 重定向到内联 `data:` URL shim（进程级幂等，归零才注销），再 `import()` staged 的 `src/index.ts`。
 4. 用最小 `WorldContext` / `WorldHost` 模拟宿主，把插件产出的 9 个 `ToolDef` 映射成 Aurabot 工具，再追加 1 个适配层自有的换票工具（`parlor_identity_ticket`）。
+5. 装配完成后、`world.start()` 之前跑一次**启动前席位自愈**（详见下方同名小节），把游标与远端席位都对齐到设置里的 `room`。
 
-升级 Coopanion 后请复验：适配层依赖 `world.focused` 与 `world.myTableRevision` 两个**私有运行时字段**，以及用于识别牌局结算的私有方法 `world.onRoomEvent`；它们不在上游公开契约内。字段缺失时按 fail-open 处理（宁可多投递，不永久静默），语义变化则会导致回合误判或漏判。
+升级 Coopanion 后请复验：适配层依赖 `world.focused` 与 `world.myTableRevision` 两个**私有运行时字段**，以及用于识别牌局结算的私有方法 `world.onRoomEvent`；它们不在上游公开契约内。字段缺失时按 fail-open 处理（宁可多投递，不永久静默），语义变化则会导致回合误判或漏判。启动前席位自愈还镜像了 5 处上游私有常量与 1 处判断——游标文件名 `parlor-cursor.json`、秘密名 `PARLOR_CURRENT_ROOM`、客户端版本头 `0.45.2`、能力头 `seat-location-v1`（即 `x-parlor-capabilities`，对应上游 `src/room/client.ts`）、公开默认邀请码 `parlor-cPBpxGcsOhzd`，以及游标 `server` 归属判断（对应上游 `world.ts#L646`）；上游一改，自愈会静默失效，需一并复验。
+
+### 启动前席位自愈
+
+**为什么需要**：上游 `connect()` 里的 `loadCursors()` 会用 `parlor-cursor.json` 的 `current` **无条件覆盖**配置里的 `room`（上游 `src/world.ts#L650`，唯一守卫只是 `server` 地址匹配）。房间一旦被旧游标拉回错误客厅，而本地席位令牌恰好失效，入座就会撞上服务端「一身份一席位」的限制，报「你已经在另一个客厅里；先离开或换房」。
+
+**何时执行**：模块 setup 阶段、`world.start()` 之前，每次加载与热重载各跑一次。
+
+三步动作：
+
+1. **游标规范化**（纯本地、无网络）：把 `parlor-cursor.json` 的 `current` 改成设置里的 `room`，其它字段原样保留；同时写入 `PARLOR_CURRENT_ROOM`。若游标里的 `server` 与当前会馆不一致，**只跳过 `current` 改写**（上游本就整份忽略该游标），秘密仍写。
+2. **查真实席位**：换身份票 → `GET /v1/me`（身份头）取真实席位所在客厅 → `GET /v1/me/location`（席位令牌）判定令牌是否仍有效。
+3. **换房或释放**：
+   - 令牌有效且已在目标客厅，或远端无席位 → 续用，不动令牌；
+   - 令牌有效但在别的客厅 → `POST /v1/rooms/{真实}/switch`，成功后写回新令牌；
+   - 换房结果不确定（回包丢失 / 非 2xx / 缺 token）→ 用身份票重读 `/v1/me` 重新判定真实位置再决定；
+   - 令牌已失效 → `POST /v1/rooms/{真实}/leave`（先旧令牌，未成功——含 401/403 及任何非 2xx——再用身份票重试一次），成功或 404 视为已释放，并**清空** `PARLOR_SEAT_TOKEN`。
+
+**时间预算**：总预算 25 秒（`BUDGET_MS`），单请求 8 秒、探测 5 秒；超预算抛错后降级为跳过。
+
+**失败绝不阻断启动**：预检任何异常只记日志并降级为原流程；只有 `world.start()` 自身失败才会出现「模块加载成功但工具返回客厅尚未连接」。
+
+**邀请码三级兜底**：Coopanion `config.json` 的 `worlds.parlor.inviteCode`（等于公开默认码时不直接用；Aurabot 面板里没有这个开关，只有 Coopanion 配置里有）→ 自有 `secrets.json` 或 Coopanion `.env` 的 `PARLOR_INVITE_CODE` → 公开默认码 `parlor-cPBpxGcsOhzd`，且**仅当会馆地址就是 `https://parlor.com.cn` 时**才默认启用第三级（自建会馆一般不启用；例外是 config 里显式填的正好是这个公开默认码、`.env` 又没有码，最终仍会回落到它）。三级都取不到则跳过远端两步（查席位、换房或释放），但第 1 步的本地游标改写（`current` 与 `PARLOR_CURRENT_ROOM`）已经执行。
+
+**失败时的错误摘要**：仍报「已经在另一个客厅里」时，会在原错误后追加 `（真实席位在 …；目标客厅 …；自愈：…）`。摘要只含客厅 id / 名称与自愈动作，**不含任何令牌**。
+
+**常用日志**：
+
+- `客厅游标已指向目标客厅 …（原为 …）`
+- `客厅席位预检：已在目标客厅 …，无需处理`
+- `已把席位从客厅 … 自动换到目标客厅 …`
+- `已释放客厅 … 的残留席位，随后会重新入座目标客厅 …`
+- `未配置邀请码，已跳过席位自愈预检`
+- `客厅席位仍被占用：…`
 
 ## 已知限制
 
@@ -96,6 +131,12 @@ Aurabot（DSH 插件）模块：复用本机 Coopanion 已安装的 `cortico-wor
 - 延迟事件队列上限 20 条，超出丢最早的。
 - `targetChat` 填错格式时不会报错，只会静默不唤醒（日志为 debug 级）。
 - `world.start()` 失败（网络或远端不可用）时模块仍算加载成功：工具仍可调用，但统一返回「客厅尚未连接」，仅 `parlor_query {op:"help"}` 这类纯本地帮助不受影响。源码加载或定位失败则相反——直接抛错，模块被标记失败。
+- **自愈预检会占启动时间**：总预算 25 秒，启动与每次热重载最多可能被拖慢这么久；超预算只降级跳过，不保证自愈成功。
+- **自愈依赖身份票与邀请码**：缺邀请码、缺身份字段或会馆地址不合法时，远端两步（查席位、换房或释放）会被跳过、只打一条 warn；但第 1 步的本地游标改写（`current` 与 `PARLOR_CURRENT_ROOM`）**已经执行**。自建会馆若没配 `PARLOR_INVITE_CODE`，远端自愈不会发生。
+- **自愈会改远端状态**：`switch` 会让旧席位令牌立即失效，`leave` 会真的腾出席位（会馆网页上可见）。
+- **重启会被拉回设置的 `room`**：运行中通过工具换房后，重启会回到设置里的 `room`（自愈以设置为准），容易被误认成 bug。拉回来自第 1 步的 `normalizeCursor`——纯本地逻辑，在邀请码与身份校验之前执行，因此**即使远端步骤被跳过，这次本地游标改写仍会生效**，重启依旧回到设置里的 `room`。
+- **自愈失败时启动错误文案变长**：错误里会带上真实席位与目标客厅的 id / 名称（不含令牌）。
+- **自愈镜像了上游私有实现**：5 处私有常量与 1 处判断（游标文件名 `parlor-cursor.json`、`PARLOR_CURRENT_ROOM`、客户端版本头 `0.45.2`、能力头 `seat-location-v1`、公开默认邀请码 `parlor-cPBpxGcsOhzd`、游标 `server` 归属），上游变更会导致自愈**静默失效**。
 
 ## 许可证
 
