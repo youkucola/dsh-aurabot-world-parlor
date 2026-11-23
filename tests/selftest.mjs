@@ -151,6 +151,23 @@ async function main() {
       }
     })
 
+    // room 决定每次启动连哪个客厅，标题/类型/占位被打错字不会被别的用例抓到；它也不是牌桌行为项，
+    // 因此不塞进下面那条「牌桌配置项」循环，单独一条 check 更贴切。
+    await check('设置项：room 的标题、类型、占位与默认值不得被改坏', () => {
+      const rooms = SETTINGS.filter((s) => s.key === 'room')
+      assert.equal(rooms.length, 1, 'room 设置项必须恰好 1 条（重复定义会让面板出现两个输入框）')
+      const setting = rooms[0]
+      assert.equal(setting.label, '启动目标房间', 'room 面板标题不符')
+      assert.equal(setting.type, 'text', 'room 必须是文本输入')
+      assert.equal(setting.placeholder, 'hall', 'room 占位示例应为 hall')
+      assert.equal(DEFAULTS.room, 'hall', 'room 默认值不得被连带改坏')
+      // hint 会整段显示在面板里：只钉「重启」「自愈」两个语义关键词，全文润色不该让自测变红。
+      const hint = String(setting.hint || '')
+      assert.ok(hint.length > 0, 'room 缺 hint')
+      assert.ok(hint.includes('重启'), `room 的 hint 必须说明重启时以配置为准：${hint}`)
+      assert.ok(hint.includes('自愈'), `room 的 hint 必须说明重启后会被自愈换回：${hint}`)
+    })
+
     await check('resolve 钩子引用计数 / 注销 / 未知 specifier', () => {
       assert.equal(corticoHookSnapshot().count, 0, '自测开始时不应有未释放的钩子')
       const r1 = installCorticoHooks()
@@ -1428,6 +1445,143 @@ async function main() {
           if (inst) { await inst.stop(); inst.releaseHooks() }
         }
       }
+    })
+
+    // 「重读成功（200）但 seat 为空」：远端已经没有席位可释放，因此这条路径必须一棵 leave 都不发；
+    // 旧令牌已被服务端作废，必须清空让上游重新入座（只清席位令牌，owner 令牌保留不动）；摘要经
+    // seatConflictHint 落到 lastError：动作归为「无需处理」，realRoom 一并复位，失败文案不得再指向
+    // 那个已经不存在的客厅。注意这几条都是通过 lastError 文案间接断言的——adapter 不外传 summary，
+    // 所以 summary.tokenValid 的复位这里看不到，由紧随其后「换房结果不确定且重读已无席位」的直调用例钉住。
+    // switch 形态选 HTTP 500：与「重读仍在原客厅」用例同源，「2xx 缺 token」这个入口已由上面的
+    // variants 用例钉住，本用例只关心 !confirmedRoom 这个出口，fake 响应保持单一错误体即可。
+    await check('席位自愈：switch 失败后重读远端已无席位 → 不发 leave、清空旧令牌', async () => {
+      const api = makeRecoveryApi('recover-switch-uncertain-empty')
+      const dataDir = api.dataDir('cortico')
+      fs.writeFileSync(path.join(dataDir, 'secrets.json'),
+        JSON.stringify({ PARLOR_SEAT_TOKEN: OLD_SEAT, PARLOR_OWNER_TOKEN: 'fake-owner-recover-selftest' }))
+      const calls = []
+      let meReads = 0
+      const realFetch = globalThis.fetch
+      globalThis.fetch = async (url, init) => {
+        const u = String(url)
+        calls.push({ url: u, init })
+        if (u === 'https://parlor.example.invalid/v1/identity/session') {
+          return jsonOut({ token: RECOVERY_TICKET, expiresAt: Date.now() + 600_000, person: {} })
+        }
+        if (u === `${RECOVERY_BASE}/v1/me`) {
+          // 首次查位：席位还在原客厅；switch 之后的重读：远端已无席位（200 且 seat 为 null）。
+          meReads += 1
+          return jsonOut(meReads === 1 ? ME_SEAT('r-old') : { ...ME_SEAT('r-old'), seat: null })
+        }
+        if (u === `${RECOVERY_BASE}/v1/me/location`) return jsonOut({ room: 'r-old', seat: ME_SEAT('r-old').seat })
+        if (u === `${RECOVERY_BASE}/v1/rooms/r-old/switch`) return jsonOut({ error: '服务端内部错误' }, 500)
+        throw new Error(`selftest: 未预期请求 ${u}`)
+      }
+      let inst = null
+      const before = logs.length
+      try {
+        inst = await createAdapter({
+          api, settings: { ...config, room: 'r-target' },
+          overrides: { coopanionHome: fakeHome, pluginDir: RECOVERY_PLUGIN },
+        })
+        // 摘要只在启动仍失败时才经 seatConflictHint 拼进错误文案，故这里让 world 启动失败。
+        inst.world.start = async () => { throw new Error('你已经在另一个客厅里；先离开或换房') }
+        await inst.start()
+        assert.equal(inst.state.started, false, 'world 启动应失败')
+        // 本分支最关键的不变量：重读确认远端无席位后只读不发，绝不能出现任何 leave。
+        assert.deepEqual(calls.map((c) => c.url), [
+          'https://parlor.example.invalid/v1/identity/session',
+          `${RECOVERY_BASE}/v1/me`,
+          `${RECOVERY_BASE}/v1/me/location`,
+          `${RECOVERY_BASE}/v1/rooms/r-old/switch`,
+          `${RECOVERY_BASE}/v1/me`,
+        ], `只允许「换票→查位→定位→换房→重读」5 个请求：${calls.map((c) => c.url).join(',')}`)
+        assert.equal(calls.filter((c) => c.url.includes('/leave')).length, 0,
+          '远端已无席位时发 leave 等于对着空客厅改远端状态')
+        assert.equal(calls[2].init.headers.authorization, `Bearer ${OLD_SEAT}`, '换房前必须先用本地令牌确认过位置')
+        assert.equal(calls[3].init.method, 'POST', '换房必须是 POST')
+        assert.equal(calls[3].init.headers.authorization, `Bearer ${OLD_SEAT}`)
+        // 重读用身份票：旧令牌此刻可能已经失效，带它去读会得到一条假的「无席位」结论。
+        const reread = calls[4]
+        assert.equal(reread.init.headers['x-parlor-identity'], RECOVERY_TICKET, '重读 /v1/me 必须用身份票')
+        assert.equal(reread.init.headers.authorization, undefined, '重读不得带可能已失效的旧令牌')
+        // 旧令牌已失效：清空让上游重新入座；只清席位令牌，不动 owner。
+        assert.equal(inst.ctx.secret('PARLOR_SEAT_TOKEN'), '', '旧令牌必须被清空')
+        const secrets = JSON.parse(fs.readFileSync(path.join(dataDir, 'secrets.json'), 'utf8'))
+        assert.equal(secrets.PARLOR_SEAT_TOKEN, '', '磁盘上的旧令牌也必须被清空')
+        assert.equal(secrets.PARLOR_OWNER_TOKEN, 'fake-owner-recover-selftest', '只清席位令牌，不动 owner 令牌')
+        const after = logs.slice(before)
+        assert.ok(after.some((l) => l.includes('客厅席位预检：换房后远端已没有席位，旧令牌已清空，无需再释放')),
+          `必须留下本分支的说明日志：${after.join(' | ')}`)
+        assert.ok(!after.some((l) => l.includes('已释放客厅')), '本分支不得出现「已释放客厅」（证明没走 leave）')
+        assert.ok(!after.join('\n').includes(OLD_SEAT), '日志不得出现旧令牌')
+        // 摘要复位：realRoom 已作废，失败文案不得再指向那个不存在的客厅，动作也要从「换房失败」改成 none。
+        assert.ok(!inst.state.lastError.includes('r-old'), `摘要必须复位真实席位：${inst.state.lastError}`)
+        assert.ok(inst.state.lastError.includes('无需处理'), `动作应归为 none：${inst.state.lastError}`)
+        assert.ok(!inst.state.lastError.includes('换房失败'), `不得仍报换房失败：${inst.state.lastError}`)
+        assert.ok(!inst.state.lastError.includes(OLD_SEAT), '错误文案不得出现旧令牌')
+      } finally {
+        globalThis.fetch = realFetch
+        if (inst) { await inst.stop(); inst.releaseHooks() }
+      }
+    })
+
+    // 上一条同一分支的用例走 adapter：summary 不外传，只能从 lastError 文案间接观察，
+    // 因此 summary.tokenValid 的复位必须直调 recoverSeat 才能断言到（形态照抄下面的 skipped 用例：
+    // 同一套 base 夹具 + 注入 fetchImpl，不碰插件、不碰 home）。
+    await check('recoverSeat：换房结果不确定且重读已无席位 → summary.tokenValid 复位为 false、不发 leave', async () => {
+      const base = {
+        baseUrl: RECOVERY_BASE,
+        identity: { cooId: 'selftest-coo-0001', cooSecret: FAKE.secret },
+        identitySource: 'https://parlor.example.invalid',
+        invite: 'inv-selftest', seatName: 'Coo', targetRoom: 'r-target',
+        secret: (name) => (name === 'PARLOR_SEAT_TOKEN' ? OLD_SEAT : ''),
+      }
+      const calls = []
+      const writes = []
+      let meReads = 0
+      const fetchImpl = async (url, init) => {
+        const u = String(url)
+        calls.push({ url: u, init })
+        if (u === 'https://parlor.example.invalid/v1/identity/session') {
+          return jsonOut({ token: RECOVERY_TICKET, expiresAt: Date.now() + 600_000, person: {} })
+        }
+        if (u === `${RECOVERY_BASE}/v1/me`) {
+          // 首次查位：席位还在原客厅；switch 之后的重读：200 且 seat 为 null（远端已无席位）。
+          meReads += 1
+          return jsonOut(meReads === 1 ? ME_SEAT('r-old') : { ...ME_SEAT('r-old'), seat: null })
+        }
+        if (u === `${RECOVERY_BASE}/v1/me/location`) return jsonOut({ room: 'r-old', seat: ME_SEAT('r-old').seat })
+        if (u === `${RECOVERY_BASE}/v1/rooms/r-old/switch`) return jsonOut({ error: '服务端内部错误' }, 500)
+        throw new Error(`selftest: 未预期请求 ${u}`)
+      }
+      const summary = await recoverSeat({
+        ...base, fetchImpl, storeSecret: (name, value) => { writes.push({ name, value }) },
+      })
+      // 两个前置事实证明「进过 tokenValid === true 的分支」，否则下面断言 false 只是在断言对象初值：
+      // ① location 返回 200 才会把 tokenValid 置 true；② switch 只在 `if (summary.tokenValid)` 里发。
+      assert.deepEqual(calls.map((c) => c.url), [
+        'https://parlor.example.invalid/v1/identity/session',
+        `${RECOVERY_BASE}/v1/me`,
+        `${RECOVERY_BASE}/v1/me/location`,
+        `${RECOVERY_BASE}/v1/rooms/r-old/switch`,
+        `${RECOVERY_BASE}/v1/me`,
+      ], `只允许「换票→查位→定位→换房→重读」5 个请求：${calls.map((c) => c.url).join(',')}`)
+      assert.equal(calls.filter((c) => c.url.includes('/leave')).length, 0, '远端已无席位时不得发 leave')
+      assert.equal(calls[2].init.headers.authorization, `Bearer ${OLD_SEAT}`, '定位必须带本地席位令牌')
+      assert.equal(calls[3].init.method, 'POST', '换房必须是 POST')
+      assert.equal(calls[3].init.headers.authorization, `Bearer ${OLD_SEAT}`)
+      assert.equal(calls[4].init.headers['x-parlor-identity'], RECOVERY_TICKET, '重读必须用身份票')
+      assert.equal(calls[4].init.headers.authorization, undefined, '重读不得带可能已失效的旧令牌')
+      // 本用例真正要钉住的复位：令牌已被清空，摘要不能仍自称「令牌有效」而指向一个空客厅。
+      assert.equal(summary.tokenValid, false, 'tokenValid 必须复位为 false')
+      assert.equal(summary.action, 'none', '动作应归为无需处理')
+      assert.equal(summary.ok, true)
+      assert.equal(summary.realRoom, '', 'realRoom 必须清空')
+      assert.equal(summary.realRoomName, '')
+      assert.equal(summary.detail, '换房后远端已无席位，已清空旧席位令牌')
+      // 清空只落在席位令牌上，且只写一次（owner 令牌不是 recoverSeat 的职责）。
+      assert.deepEqual(writes, [{ name: 'PARLOR_SEAT_TOKEN', value: '' }], '只清席位令牌')
     })
 
     await check('席位自愈：本地令牌 401 → 先用旧令牌、再用身份票释放并清空令牌', async () => {
